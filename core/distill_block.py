@@ -9,6 +9,7 @@ import pickle
 
 
 class ForwardHelper(nn.Module):
+  """把一串層依序執行的小工具；遇到 FeatureAtt 層時額外傳入左圖特徵。"""
   def __init__(self, layers:list):
     super().__init__()
     self.layers = nn.ModuleList(layers)
@@ -23,6 +24,8 @@ class ForwardHelper(nn.Module):
 
 
 class PostForwardHelper(nn.Module):
+  """hourglass 上採樣階段的替換區塊：layers 內以 'sum' 或 'concat' 為分界，
+  之前的層用來上採樣 conv3(較低解析度)，之後的層處理融合結果。"""
   def __init__(self, layers:list):
     super().__init__()
     for pos in range(len(layers)):

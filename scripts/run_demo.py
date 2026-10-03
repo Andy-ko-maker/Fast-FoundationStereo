@@ -20,6 +20,7 @@ from Utils import (
 import cv2
 
 
+# 範例：單組左右影像 -> 視差圖 -> 深度 -> 點雲(可選)
 if __name__=="__main__":
   code_dir = os.path.dirname(os.path.realpath(__file__))
   parser = argparse.ArgumentParser()
@@ -46,6 +47,7 @@ if __name__=="__main__":
 
   os.system(f'rm -rf {args.out_dir} && mkdir -p {args.out_dir}')
 
+  # 讀取權重資料夾內的 cfg.yaml，再用命令列參數覆蓋同名設定
   with open(f'{os.path.dirname(args.model_dir)}/cfg.yaml', 'r') as ff:
     cfg:dict = yaml.safe_load(ff)
   for k in args.__dict__:
@@ -81,6 +83,7 @@ if __name__=="__main__":
 
   img0 = torch.as_tensor(img0).cuda().float()[None].permute(0,3,1,2)
   img1 = torch.as_tensor(img1).cuda().float()[None].permute(0,3,1,2)
+  # 網路要求影像長寬為 32 的倍數，先補邊，推論後再還原
   padder = InputPadder(img0.shape, divis_by=32, force_square=False)
   img0, img1 = padder.pad(img0, img1)
 
@@ -105,6 +108,7 @@ if __name__=="__main__":
   cv2.imshow('disp', resized_vis[:,:,::-1])
   cv2.waitKey(0)
 
+  # 右圖對應點 x 座標 < 0 代表只在左圖可見(超出右圖視野)，視為無效
   if args.remove_invisible:
     yy,xx = np.meshgrid(np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing='ij')
     us_right = xx-disp
@@ -117,7 +121,7 @@ if __name__=="__main__":
       K = np.array(list(map(float, lines[0].rstrip().split()))).astype(np.float32).reshape(3,3)
       baseline = float(lines[1])
     K[:2] *= scale
-    depth = K[0,0]*baseline/disp
+    depth = K[0,0]*baseline/disp   # 深度 = 焦距 * 基線 / 視差
     np.save(f'{args.out_dir}/depth_meter.npy', depth)
     xyz_map = depth2xyzmap(depth, K)
     pcd = toOpen3dCloud(xyz_map.reshape(-1,3), img0_ori.reshape(-1,3))
