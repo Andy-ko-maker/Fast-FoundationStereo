@@ -19,18 +19,22 @@ from core.utils.utils import InputPadder
 import Utils as U
 import time
 
+# 相容性設定：舊版序列化權重(.pth)會用 'foundation_stereo_ori.*' 這個模組路徑還原模型，
+# 這裡把它們指向目前的 core.* 模組，讓 torch.load 能順利載入舊權重。
 sys.modules['foundation_stereo_ori'] = sys.modules['core']
 sys.modules['foundation_stereo_ori.submodule'] = sys.modules['core.submodule']
 sys.modules['foundation_stereo_ori.extractor'] = sys.modules['core.extractor']
 sys.modules['foundation_stereo_ori.update'] = sys.modules['core.update']
 sys.modules['foundation_stereo_ori.foundation_stereo'] = sys.modules['core.foundation_stereo']
 class FoundationStereo(nn.Module):
+  # 空殼類別：只為了讓舊權重反序列化時找得到這個名稱
   pass
 
 
 
 def normalize_image(img):
     '''
+    影像正規化：0-255 -> 0-1，再套用 ImageNet 的平均值/標準差。
     @img: (B,C,H,W) in range 0-255, RGB order
     '''
     mean = img.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -39,6 +43,13 @@ def normalize_image(img):
 
 
 class hourglass(nn.Module):
+    """3D 沙漏式代價體(cost volume)聚合網路。
+
+    流程：先下採樣三次 (1/8 -> 1/16 -> 1/32)，每層用左圖特徵做注意力(FeatureAtt)校正，
+    再逐層上採樣並與同尺度特徵融合；同時另有一條「視差注意力」分支補強全域資訊。
+    post32_to_16 / post16_to_8 / post8_to_4 預設為 None；若被替換成其他模組
+    (例如 NAS 搜出的區塊，見 distill_block.py)，forward 就會改走替換後的路徑。
+    """
     def __init__(self, cfg, in_channels, feat_dims=None):
         super().__init__()
         self.cfg = cfg
@@ -94,6 +105,8 @@ class hourglass(nn.Module):
         self.post8_to_4 = None
 
     def forward(self, x, features):
+        # x: 代價體 (B,C,D,H,W)；features: 左圖多尺度特徵 [1/4, 1/8, 1/16, 1/32]
+        # ---- 下採樣路徑 ----
         conv1 = self.conv1(x)
         conv1 = self.feature_att_8(conv1, features[1])
 
@@ -102,6 +115,7 @@ class hourglass(nn.Module):
 
         conv3 = self.conv3(conv2)
         conv3 = self.feature_att_32(conv3, features[3])
+        # ---- 上採樣路徑：1/32 -> 1/16 (預設結構，或使用替換模組) ----
         if not hasattr(self, 'post32_to_16') or self.post32_to_16 is None:
           conv3_up = self.conv3_up(conv3)
           conv2 = torch.cat((conv3_up, conv2), dim=1)
@@ -110,6 +124,7 @@ class hourglass(nn.Module):
         else:
           conv2 = self.post32_to_16(conv2, conv3, features[2])
 
+        # ---- 1/16 -> 1/8 ----
         if not hasattr(self, 'post16_to_8') or self.post16_to_8 is None:
           conv2_up = self.conv2_up(conv2)
           conv1 = torch.cat((conv2_up, conv1), dim=1)
@@ -118,6 +133,7 @@ class hourglass(nn.Module):
         else:
           conv1 = self.post16_to_8(conv1, conv2, features[1])
 
+        # ---- 1/8 -> 1/4，並加上視差注意力分支的結果 ----
         conv = self.conv1_up(conv1)
         if not hasattr(self, 'post8_to_4') or self.post8_to_4 is None:
           x = self.conv_patch(x)
@@ -132,6 +148,15 @@ class hourglass(nn.Module):
 
 
 class FastFoundationStereo(nn.Module):
+  """Fast-FoundationStereo 主模型（別名 FoundationStereoLite）。
+
+  整體流程：
+    1. 特徵抽取(蒸餾後的單一骨幹) -> 左右圖多尺度特徵
+    2. 建立代價體：分組相關(GWC) + 串接(concat)
+    3. hourglass 3D 聚合代價體，分類器輸出視差機率 -> 初始視差 init_disp
+    4. 以 GRU 迭代在 1/4 解析度細修視差（每次查詢幾何編碼體）
+    5. 以學到的上採樣權重(context_upsample)還原到原圖解析度
+  """
   def __init__(self, args):
     super().__init__()
     self.args = args
@@ -180,6 +205,8 @@ class FastFoundationStereo(nn.Module):
 
 
   def upsample_disp(self, disp, mask_feat_4, stem_2x):
+    # 將 1/4 解析度視差上採樣 4 倍：用 softmax 權重對 3x3 鄰域做加權(凸組合)。
+    # 視差值本身要乘 4，因為像素座標放大了 4 倍。
     with torch.amp.autocast('cuda', enabled=self.args.mixed_precision, dtype=U.AMP_DTYPE):
       xspx = self.spx_2_gru(mask_feat_4, stem_2x)   # 1/2 resolution
       spx_pred = self.spx_gru(xspx)
@@ -189,17 +216,26 @@ class FastFoundationStereo(nn.Module):
 
 
   def forward(self, image1, image2, iters=12, test_mode=False, low_memory=False, init_disp=None, profile=False, optimize_build_volume='pytorch1'):
-    """ Estimate disparity between pair of frames """
+    """ Estimate disparity between pair of frames
+    image1/image2: (B,3,H,W)，0-255 RGB，H、W 需為 32 的倍數(可用 InputPadder 補齊)
+    iters: GRU 迭代次數，越多越準但越慢
+    test_mode: True 只回傳最後一次迭代的視差；False 回傳 (init_disp, 各迭代視差列表) 供訓練
+    low_memory: 以較省記憶體的 1D 取樣方式查詢幾何編碼體
+    init_disp: 外部給定的初始視差(1/4 解析度)，None 則由分類器自行估計
+    optimize_build_volume: GWC 代價體的建構實作，'pytorch1' 或 'triton'
+    """
     B,C,H,W = image1.shape
     low_memory = low_memory or (self.args.get('low_memory', False))
     image1 = normalize_image(image1)
     image2 = normalize_image(image2)
     with torch.amp.autocast('cuda', enabled=self.args.mixed_precision, dtype=U.AMP_DTYPE):
+      # 左右圖拼成同一批次一起過骨幹，省一次前向；之後再依 batch 維度切開
       out = self.feature(torch.cat([image1, image2], dim=0))
       features_left = [o[:B] for o in out]
       features_right = [o[B:] for o in out]
-      stem_2x = self.stem_2(image1)
+      stem_2x = self.stem_2(image1)   # 1/2 解析度細節特徵，供最後上採樣使用
 
+      # 分組相關代價體 (group-wise correlation)，在 1/4 解析度、max_disp/4 個視差假設上計算
       if optimize_build_volume=='pytorch1':
         gwc_volume = build_gwc_volume_optimized_pytorch1(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
       elif optimize_build_volume=='triton':
@@ -207,6 +243,7 @@ class FastFoundationStereo(nn.Module):
       else:
         raise RuntimeError(f"Invalid optimize_build_volume: {optimize_build_volume}")
 
+      # 串接代價體：先把特徵降維，再沿視差方向把左右特徵串在一起
       left_tmp = self.proj_cmb(features_left[0])
       right_tmp = self.proj_cmb(features_right[0])
       concat_volume = build_concat_volume_optimized_pytorch1(left_tmp, right_tmp, maxdisp=self.args.max_disp//4)
@@ -214,6 +251,7 @@ class FastFoundationStereo(nn.Module):
       comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)
       del concat_volume, gwc_volume
 
+      # 代價體聚合：stem -> 左圖特徵注意力 -> hourglass
       comb_volume = self.corr_stem(comb_volume)
       comb_volume = self.corr_feature_att(comb_volume, features_left[0])
       comb_volume = self.cost_agg(comb_volume, features_left)
@@ -224,6 +262,8 @@ class FastFoundationStereo(nn.Module):
       if init_disp is None:
         init_disp = disparity_regression(prob, self.args.max_disp//4)
 
+      # 上下文網路：產生 GRU 的初始隱藏狀態(net_list, tanh)與輸入(inp_list, relu)，
+      # 並套用通道注意力(cam)與空間注意力(sam)
       cnet_list = self.cnet(features_left[0], features_left[1], features_left[2])
       cnet_list = list(cnet_list)
       net_list = [torch.tanh(x[0]) for x in cnet_list]
@@ -231,9 +271,11 @@ class FastFoundationStereo(nn.Module):
       inp_list = [self.cam(x) * x for x in inp_list]
       att = [self.sam(x) for x in inp_list]
 
+    # 幾何編碼體：把聚合後代價體與左右特徵的全對相關(all-pairs correlation)做成金字塔，
+    # 之後每次迭代依目前視差去取樣
     geo_fn = Combined_Geo_Encoding_Volume(features_left[0].to(self.dtype), features_right[0].to(self.dtype), comb_volume.to(self.dtype), num_levels=self.args.corr_levels)
     b, c, h, w = features_left[0].shape
-    coords = torch.arange(w, dtype=torch.float, device=init_disp.device).reshape(1,1,w,1).repeat(b, h, 1, 1)
+    coords = torch.arange(w, dtype=torch.float, device=init_disp.device).reshape(1,1,w,1).repeat(b, h, 1, 1)   # 每個像素的 x 座標
     disp = init_disp.to(self.dtype)
     disp_preds = []
 
@@ -262,6 +304,9 @@ class FastFoundationStereo(nn.Module):
 
 
   def run_hierachical(self, image1, image2, iters=12, test_mode=False, low_memory=False, small_ratio=0.5):
+      # 由粗到細(兩階段)推論，適合高解析度影像：
+      # 1) 先把影像縮小 small_ratio 倍跑一次，得到粗視差；
+      # 2) 將粗視差放大回原尺寸，當作原解析度推論的 init_disp，減少所需的視差搜尋範圍。
       B,_,H,W = image1.shape
       img1_small = F.interpolate(image1, scale_factor=small_ratio, align_corners=False, mode='bilinear')
       img2_small = F.interpolate(image2, scale_factor=small_ratio, align_corners=False, mode='bilinear')
@@ -284,6 +329,8 @@ FoundationStereoLite = FastFoundationStereo
 
 
 class TrtFeatureRunner(nn.Module):
+  """匯出 TensorRT 用的「前半段」：特徵骨幹 + stem。
+  輸出左圖 4 個尺度特徵、右圖 1/4 特徵、以及 1/2 解析度 stem 特徵。"""
   def __init__(self, model):
     super().__init__()
     self.feature = model.feature
@@ -301,6 +348,8 @@ class TrtFeatureRunner(nn.Module):
 
 
 class TrtPostRunner(nn.Module):
+  """匯出 TensorRT 用的「後半段」：代價體聚合 -> 初始視差 -> GRU 迭代 -> 上採樣。
+  GWC 代價體由外部(Triton kernel)算好後傳入，迭代次數固定為 args.valid_iters。"""
   def __init__(self, model):
     super().__init__()
     self.args = model.args
@@ -373,6 +422,8 @@ class TrtPostRunner(nn.Module):
 
 
 class TrtRunner(nn.Module):
+  """TensorRT 推論封裝：載入 feature / post 兩個 engine，串接成完整流程。
+  forward: feature engine -> Triton 建 GWC 代價體 -> post engine -> 視差。"""
   def __init__(self, args, feature_runner_engine_path, post_runner_engine_path):
     super().__init__()
     import tensorrt as trt
@@ -410,6 +461,7 @@ class TrtRunner(nn.Module):
     return names
 
   def run_trt(self, engine, context, inputs_by_name:dict):
+    # 通用執行函式：校正輸入 dtype/連續性 -> 設定輸入形狀 -> 配置輸出 -> 綁定位址 -> 非同步執行
     import tensorrt as trt
     for name, tensor in list(inputs_by_name.items()):
       expected_dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
